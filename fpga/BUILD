@@ -139,6 +139,21 @@ cc_library(
     ],
 )
 
+cc_test(
+    name = "injected-features_test",
+    srcs = [
+        "injected-features_test.cc",
+    ],
+    deps = [
+        ":database",
+        ":database-parsers",
+        ":injected-features",
+        "@abseil-cpp//absl/status:statusor",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+    ],
+)
+
 cc_binary(
     name = "fpga-as",
     srcs = [
