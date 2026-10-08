@@ -5,6 +5,7 @@
 #include <functional>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
@@ -236,9 +237,78 @@ void AddStepDownFeatures(const BanksTilesRegistry &banks, const TileGrid &grid,
 using FeatureProbe =
   std::function<bool(const std::string &tile, const std::string &feature)>;
 
+// An OLOGIC identified by the grid position of its IOI tile and its site name.
+using OlogicKey = std::tuple<uint32_t, uint32_t, std::string>;
+
+// The features of an OLOGIC that passes the fabric signal through to the pad.
+// OBUF_HP_BANK_GLUE sets the first three of them.  ZINV_T1 only passes the
+// tristate through.
+constexpr std::string_view kOlogicPassThroughFeatures[] = {
+  "OQUSED",
+  "OMUX.D1",
+  "OSERDES.DATA_RATE_TQ.BUF",
+  "ZINV_T1",
+};
+
+// Returns the OLOGICs that hold a cell, that is an ODDR or an OSERDES on the
+// data or on the tristate.  They have a feature beyond the pass-through ones.
+absl::flat_hash_set<OlogicKey> FindOlogicsHoldingACell(
+  const TileGrid &grid, const std::vector<FasmFeature> &features) {
+  absl::flat_hash_set<OlogicKey> ologics;
+  for (const FasmFeature &feature : features) {
+    if (feature.bits == 0) {
+      continue;
+    }
+    const std::vector<std::string> segments =
+      absl::StrSplit(feature.name, absl::MaxSplits('.', 2));
+    if (segments.size() < 3 || !absl::StartsWith(segments[1], "OLOGIC_Y")) {
+      continue;
+    }
+    bool is_pass_through = false;
+    for (const std::string_view pass_through : kOlogicPassThroughFeatures) {
+      is_pass_through |= segments[2] == pass_through;
+    }
+    const auto tile_it = grid.find(segments[0]);
+    if (is_pass_through || tile_it == grid.end()) {
+      continue;
+    }
+    const Location &coord = tile_it->second.coord;
+    ologics.insert({coord.x, coord.y, segments[1]});
+  }
+  return ologics;
+}
+
+// Returns true when the OLOGIC beside an HP IOB site holds a cell.  The IOI
+// tile is the IOB tile's neighbor on the fabric side, in the same grid row,
+// and IOB_Yn pairs with OLOGIC_Yn.
+bool OlogicBesideHoldsACell(const TileGrid &grid, const std::string &iob_tile,
+                            const std::string &iob_site,
+                            const absl::flat_hash_set<OlogicKey> &ologics) {
+  const auto tile_it = grid.find(iob_tile);
+  if (tile_it == grid.end() || iob_site.empty()) {
+    return false;
+  }
+  const Location &coord = tile_it->second.coord;
+  const bool iob_is_on_the_left = absl::StartsWith(iob_tile, "LIOB18");
+  if (!iob_is_on_the_left && coord.x == 0) {
+    return false;
+  }
+  const uint32_t ioi_x = iob_is_on_the_left ? coord.x + 1 : coord.x - 1;
+  return ologics.contains(
+    {ioi_x, coord.y, absl::StrFormat("OLOGIC_Y%c", iob_site.back())});
+}
+
 // HP bank IOBs need driver and input enable bits that Vivado programs for
 // every used IOB and that the HR bank IOBs get from their factory defaults.
-void AddHpBankGlueFeatures(const std::vector<FasmFeature> &features,
+//
+// The output buffer glue is not the IOB's: it sets OQUSED, OMUX.D1 and
+// OSERDES.DATA_RATE_TQ.BUF of the OLOGIC beside the IOB, which is how that
+// OLOGIC passes the fabric signal through to the pad.  An OLOGIC that holds a
+// cell is configured by the FASM already.  The glue would drive the pad from
+// D1 around the register and conflict with a registered tristate, so such an
+// output gets no glue.
+void AddHpBankGlueFeatures(const TileGrid &grid,
+                           const std::vector<FasmFeature> &features,
                            const std::string &pudc_b_tile,
                            const FeatureProbe &has_feature,
                            std::vector<FasmFeature> &out) {
@@ -289,6 +359,8 @@ void AddHpBankGlueFeatures(const std::vector<FasmFeature> &features,
     }
   }
 
+  const absl::flat_hash_set<OlogicKey> ologics_holding_a_cell =
+    FindOlogicsHoldingACell(grid, features);
   for (const auto &usage_pair : site_usage) {
     const std::vector<std::string> tile_site =
       absl::StrSplit(usage_pair.first, '.');
@@ -309,7 +381,8 @@ void AddHpBankGlueFeatures(const std::vector<FasmFeature> &features,
         AddFeature(out, absl::StrFormat("%s.%s", tile, glue));
       }
     }
-    if (usage.out) {
+    if (usage.out &&
+        !OlogicBesideHoldsACell(grid, tile, site, ologics_holding_a_cell)) {
       const std::string glue = absl::StrFormat("%s.OBUF_HP_BANK_GLUE", site);
       if (has_feature(tile, glue)) {
         AddFeature(out, absl::StrFormat("%s.%s", tile, glue));
@@ -440,7 +513,7 @@ void InjectConfigurationFeatures(PartDatabase &db, bool emit_pudc_b_pullup,
     AddPUDCBFeatures(grid, features, injected);
   }
   AddStepDownFeatures(db.tiles().banks, grid, features);
-  AddHpBankGlueFeatures(features, pudc_b_tile, has_feature, injected);
+  AddHpBankGlueFeatures(grid, features, pudc_b_tile, has_feature, injected);
   AddGfanTieRootFeatures(features, has_feature, injected);
   AddBufrClkActiveFeatures(features, has_feature, injected);
   features.insert(features.end(), injected.begin(), injected.end());
